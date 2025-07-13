@@ -1,10 +1,24 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, WebhookClient, REST, Routes, SlashCommandBuilder, PermissionsBitField } = require('discord.js');
+const {
+    Client,
+    GatewayIntentBits,
+    WebhookClient,
+    REST,
+    Routes,
+    SlashCommandBuilder,
+    PermissionsBitField,
+    DiscordAPIError
+} = require('discord.js');
 const sqlite3 = require('sqlite3').verbose();
 const { open } = require('sqlite');
 const path = require('path');
 
-// init sqlite db
+const ALLOWED_CHANNEL_IDS = process.env.ALLOWED_CHANNEL_IDS ? process.env.ALLOWED_CHANNEL_IDS.split(',') : [];
+const RATE_LIMIT_WINDOW = 60000;
+const RATE_LIMIT_MAX = 3;
+const ROTATION_INTERVAL = 86400000; // 24 Stunden in Millisekunden
+
+const userMessageCounts = new Map();
 let db;
 
 (async () => {
@@ -15,19 +29,17 @@ let db;
         });
 
         await db.run(`CREATE TABLE IF NOT EXISTS webhooks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            userId TEXT,
-            channelId TEXT,
-            webhookId TEXT,
-            webhookToken TEXT,
-            username TEXT
+            channelId TEXT PRIMARY KEY,
+            webhookId TEXT NOT NULL,
+            webhookToken TEXT NOT NULL
         )`);
+        console.log('Datenbank erfolgreich initialisiert.');
     } catch (error) {
-        console.error('Error initializing database:', error);
+        console.error('Fehler bei der Initialisierung der Datenbank:', error);
+        process.exit(1);
     }
 })();
 
-// init discord bot
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -37,230 +49,207 @@ const client = new Client({
     ]
 });
 
-const allowedChannelIds = ['1253848908208148571', '1253848848342716537', '1259865385834905630']; // EURE CHANNEL IDS HIER EINTRAGEN!!
-const userQueues = new Map();
-const userMessageCounts = new Map();
-const RATE_LIMIT_WINDOW = 60000;
-const RATE_LIMIT_MAX = 3;
+async function getOrCreateWebhook(channel) {
+    try {
+        const row = await db.get('SELECT webhookId, webhookToken FROM webhooks WHERE channelId = ?', channel.id);
+        if (row) {
+            return new WebhookClient({ id: row.webhookId, token: row.webhookToken });
+        }
+
+        const newWebhook = await channel.createWebhook({
+            name: 'General Webhook',
+            reason: 'Wiederverwendbarer Webhook für Nachrichten'
+        });
+
+        await db.run('INSERT INTO webhooks (channelId, webhookId, webhookToken) VALUES (?, ?, ?)',
+            channel.id, newWebhook.id, newWebhook.token
+        );
+
+        return new WebhookClient({ id: newWebhook.id, token: newWebhook.token });
+
+    } catch (error) {
+        if (error instanceof DiscordAPIError && error.code === 10015) { // Unknown Webhook
+             await db.run('DELETE FROM webhooks WHERE channelId = ?', channel.id);
+             return getOrCreateWebhook(channel);
+        }
+        console.error(`Konnte keinen Webhook für Kanal ${channel.id} erstellen oder abrufen:`, error);
+        return null;
+    }
+}
+
+async function sendWebhookMessage({ message, attachment, channel, username, displayAvatarURL }) {
+    const webhookClient = await getOrCreateWebhook(channel);
+    if (!webhookClient) {
+        console.error(`Senden fehlgeschlagen: Kein Webhook für Kanal ${channel.id} verfügbar.`);
+        return;
+    }
+    try {
+        await webhookClient.send({
+            content: message || undefined,
+            username: username,
+            avatarURL: displayAvatarURL,
+            files: attachment ? [attachment.url] : [],
+            allowedMentions: { parse: [] }
+        });
+    } catch (error) {
+        console.error('Fehler beim Senden der Webhook-Nachricht:', error);
+    }
+}
+
+async function rotateWebhooks() {
+    console.log('Starte tägliche Webhook-Rotation...');
+    const allWebhooks = await db.all('SELECT * FROM webhooks');
+    if (allWebhooks.length === 0) {
+        console.log('Keine Webhooks zur Rotation in der Datenbank gefunden.');
+        return;
+    }
+
+    let rotatedCount = 0;
+    for (const webhook of allWebhooks) {
+        try {
+            const channel = await client.channels.fetch(webhook.channelId);
+            if (!channel) throw new Error('Channel not found');
+
+            // Alten Webhook löschen (ignoriere Fehler, falls er schon weg ist)
+            const oldWebhookClient = new WebhookClient({ id: webhook.webhookId, token: webhook.webhookToken });
+            await oldWebhookClient.delete().catch(() => {});
+
+            // Neuen Webhook erstellen
+            const newWebhook = await channel.createWebhook({
+                name: 'General Webhook',
+                reason: 'Tägliche Rotation'
+            });
+
+            // Datenbankeintrag mit neuen Daten aktualisieren
+            await db.run('UPDATE webhooks SET webhookId = ?, webhookToken = ? WHERE channelId = ?',
+                newWebhook.id, newWebhook.token, channel.id
+            );
+            rotatedCount++;
+        } catch (error) {
+            // Wenn Kanal/Webhook nicht mehr existiert, aus DB löschen
+            console.warn(`Fehler bei Rotation für Kanal ${webhook.channelId}. Entferne Eintrag. Fehler: ${error.message}`);
+            await db.run('DELETE FROM webhooks WHERE channelId = ?', webhook.channelId);
+        }
+    }
+    console.log(`Webhook-Rotation abgeschlossen. ${rotatedCount} Webhooks rotiert.`);
+}
+
+
+function isUserRateLimited(userId) {
+    if (!userMessageCounts.has(userId)) {
+        userMessageCounts.set(userId, []);
+    }
+    const timestamps = userMessageCounts.get(userId);
+    const currentTime = Date.now();
+    while (timestamps.length > 0 && timestamps[0] <= currentTime - RATE_LIMIT_WINDOW) {
+        timestamps.shift();
+    }
+    timestamps.push(currentTime);
+    return timestamps.length > RATE_LIMIT_MAX;
+}
 
 client.once('ready', () => {
-    try {
-        console.log('bot is ready!');
+    console.log(`Bot ist als ${client.user.tag} bereit!`);
+    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
+    const commands = [
+        new SlashCommandBuilder()
+        .setName('webhook')
+        .setDescription('Sende eine Nachricht oder einen Anhang als Webhook.')
+        .addStringOption(option =>
+            option.setName('message')
+            .setDescription('Die zu sendende Nachricht')
+            .setRequired(false))
+        .addAttachmentOption(option =>
+            option.setName('attachment')
+            .setDescription('Der zu sendende Anhang')
+            .setRequired(false)),
+    ].map(command => command.toJSON());
 
-        // Register slash command
-        const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
-        const commands = [
-            new SlashCommandBuilder()
-                .setName('webhook')
-                .setDescription('Send a message or attachment as a webhook')
-                .addStringOption(option =>
-                    option.setName('message')
-                        .setDescription('The message to send')
-                        .setRequired(false))
-                .addAttachmentOption(option =>
-                    option.setName('attachment')
-                        .setDescription('The attachment to send')
-                        .setRequired(false)),
-        ].map(command => command.toJSON());
+    rest.put(Routes.applicationCommands(process.env.DISCORD_CLIENT_ID), { body: commands })
+        .then(() => console.log('Slash-Befehle erfolgreich registriert.'))
+        .catch(console.error);
 
-        rest.put(Routes.applicationCommands(process.env.DISCORD_CLIENT_ID), { body: commands })
-            .then(() => console.log('Successfully registered application commands.'))
-            .catch(console.error);
-    } catch (error) {
-        console.error('Error during bot initialization:', error);
-    }
+    // Starte die tägliche Rotation
+    rotateWebhooks();
+    setInterval(rotateWebhooks, ROTATION_INTERVAL);
 });
 
 client.on('interactionCreate', async interaction => {
+    if (!interaction.isCommand() || interaction.commandName !== 'webhook') return;
+
+    if (!ALLOWED_CHANNEL_IDS.includes(interaction.channelId)) {
+        await interaction.reply({ content: 'Dieser Befehl kann in diesem Kanal nicht verwendet werden.', ephemeral: true });
+        return;
+    }
+
     try {
-        if (!interaction.isCommand()) return;
+        const message = interaction.options.getString('message');
+        const attachment = interaction.options.getAttachment('attachment');
+        const user = interaction.user;
 
-        const { commandName } = interaction;
+        if (!message && !attachment) {
+            await interaction.reply({ content: 'Du musst entweder eine Nachricht oder einen Anhang angeben.', ephemeral: true });
+            return;
+        }
 
-        if (commandName === 'webhook') {
-            const message = interaction.options.getString('message');
-            const attachment = interaction.options.getAttachment('attachment');
-            const channel = interaction.channel;
-            const user = interaction.user;
-
-            if (!message && !attachment) {
-                await interaction.reply({ content: 'You must provide a message or an attachment.', ephemeral: true });
+        if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+            if (isUserRateLimited(user.id)) {
+                await interaction.reply({ content: 'Du sendest Befehle zu schnell. Bitte warte einen Moment.', ephemeral: true });
                 return;
             }
-
-            if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-                const currentTime = Date.now();
-
-                if (!userMessageCounts.has(user.id)) {
-                    userMessageCounts.set(user.id, []);
-                }
-
-                const timestamps = userMessageCounts.get(user.id);
-                timestamps.push(currentTime);
-
-                // remove old timestamps
-                while (timestamps.length > 0 && timestamps[0] <= currentTime - RATE_LIMIT_WINDOW) {
-                    timestamps.shift();
-                }
-
-                if (timestamps.length > RATE_LIMIT_MAX) {
-                    await interaction.reply({ content: 'Hast du irgendwelche Störungen?', ephemeral: true });
-                    return;
-                }
-            }
-
-            queueMessage(user.id, {
-                interaction,
-                message,
-                attachment,
-                channel,
-                username: user.username,
-                displayAvatarURL: user.displayAvatarURL({ format: 'png' })
-            });
-
-            await interaction.reply({ content: 'Message added to the queue!', ephemeral: true });
         }
+
+        await interaction.reply({ content: 'Deine Nachricht wird gesendet...', ephemeral: true });
+
+        await sendWebhookMessage({
+            message,
+            attachment,
+            channel: interaction.channel,
+            username: interaction.member.displayName,
+            displayAvatarURL: user.displayAvatarURL({ format: 'png' })
+        });
+
     } catch (error) {
-        console.error('Error processing interaction:', error);
+        console.error('Fehler bei der Verarbeitung einer Interaktion:', error);
+        if (!interaction.replied && !interaction.deferred) {
+            await interaction.followUp({ content: 'Ein Fehler ist aufgetreten.', ephemeral: true }).catch(() => {});
+        }
     }
 });
 
 client.on('messageCreate', async message => {
+    if (message.author.bot || !ALLOWED_CHANNEL_IDS.includes(message.channelId)) {
+        return;
+    }
+
     try {
-        if (message.author.bot) return;
-
-        const { author, content, channel, attachments } = message;
-
-        // check if msg in allowed channel
-        if (!allowedChannelIds.includes(channel.id)) return;
-
-        const username = message.member ? message.member.displayName : author.username;
-
         if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-            const currentTime = Date.now();
-
-            if (!userMessageCounts.has(author.id)) {
-                userMessageCounts.set(author.id, []);
-            }
-
-            const timestamps = userMessageCounts.get(author.id);
-            timestamps.push(currentTime);
-
-            // remove old timestamps
-            while (timestamps.length > 0 && timestamps[0] <= currentTime - RATE_LIMIT_WINDOW) {
-                timestamps.shift();
-            }
-
-            if (timestamps.length > RATE_LIMIT_MAX) {
-                await message.reply('Hast du irgendwelche Störungen?');
-                return;
-            }
-
-            if (timestamps.length === RATE_LIMIT_MAX) {
-                queueMessage(author.id, {
-                    message: content,
-                    attachment: attachments.first(),
-                    channel,
-                    username,
-                    displayAvatarURL: author.displayAvatarURL({ format: 'png' })
-                });
-                await message.delete();
+            if (isUserRateLimited(message.author.id)) {
+                await message.author.send('Du sendest Nachrichten zu schnell. Deine letzte Nachricht wurde ignoriert.').catch(() => {});
+                await message.delete().catch(() => {});
                 return;
             }
         }
 
-        // check if content is valid
-        if (!content && attachments.size === 0) return;
+        if (!message.content && message.attachments.size === 0) {
+            return;
+        }
 
         await sendWebhookMessage({
-            message: content,
-            attachment: attachments.first(),
-            channel,
-            username,
-            displayAvatarURL: author.displayAvatarURL({ format: 'png' })
+            message: message.content,
+            attachment: message.attachments.first(),
+            channel: message.channel,
+            username: message.member.displayName,
+            displayAvatarURL: message.author.displayAvatarURL({ format: 'png' })
         });
 
-        await message.delete();
+        await message.delete().catch(() => {});
+
     } catch (error) {
-        console.error('Error processing message:', error);
+        console.error('Fehler bei der Verarbeitung einer Nachricht:', error);
     }
 });
 
-function queueMessage(userId, msg) {
-    try {
-        if (!userQueues.has(userId)) {
-            userQueues.set(userId, []);
-        }
-        const userQueue = userQueues.get(userId);
-        userQueue.push(msg);
-        if (userQueue.length === 1) {
-            processQueue(userId);
-        }
-    } catch (error) {
-        console.error('Error queuing message:', error);
-    }
-}
-
-async function processQueue(userId) {
-    try {
-        const userQueue = userQueues.get(userId);
-        if (!userQueue || userQueue.length === 0) return;
-
-        while (userQueue.length > 0) {
-            const msg = userQueue[0];
-            await sendWebhookMessage(msg);
-            userQueue.shift();
-            await new Promise(resolve => setTimeout(resolve, 2000)); // 2 second delay
-        }
-
-        userQueues.delete(userId);
-    } catch (error) {
-        console.error('Error processing queue:', error);
-    }
-}
-
-async function sendWebhookMessage({ interaction, message, attachment, channel, username, displayAvatarURL }) {
-    try {
-        // Create a new webhook
-        const webhook = await channel.createWebhook({
-            name: username,
-            avatar: displayAvatarURL
-        });
-
-        const webhookClient = new WebhookClient({ id: webhook.id, token: webhook.token });
-
-        const files = attachment ? [{
-            attachment: attachment.url,
-            name: attachment.name
-        }] : [];
-
-        // Send message with webhook
-        await webhookClient.send({
-            content: message || (files.length > 0 ? ' ' : ''),
-            username: username,
-            avatarURL: displayAvatarURL,
-            files: files,
-            allowedMentions: { parse: ['users', 'roles'], repliedUser: false }
-        });
-
-        // Delete the webhook immediately
-        await webhook.delete();
-
-        if (interaction) {
-            await interaction.followUp({ content: 'Message sent via webhook!', ephemeral: true });
-        }
-    } catch (error) {
-        console.error('Error processing webhook message:', error);
-        if (interaction) {
-            try {
-                await interaction.followUp({ content: 'There was an error sending the webhook message.', ephemeral: true });
-            } catch (followUpError) {
-                console.error('Error sending follow-up message:', followUpError);
-            }
-        }
-    }
-}
-
 client.login(process.env.DISCORD_BOT_TOKEN).catch(error => {
-    console.error('Error logging in:', error);
+    console.error('Fehler beim Einloggen des Bots:', error);
 });
