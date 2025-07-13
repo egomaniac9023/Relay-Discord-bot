@@ -2,5 +2,5 @@ DISCORD_BOT_TOKEN=dein_bot_token_hier
 
 DISCORD_CLIENT_ID=deine_client_id_hier
 
-# Ielchen Kanälen ist der Bot aktiv ? (durch Komma trennen)
+# In welchen Kanälen ist der Bot aktiv ? (durch Komma trennen)
 ALLOWED_CHANNEL_IDS=id_von_kanal_1,id_von_kanal_2
