@@ -1,11 +1,41 @@
-# Relay-Discord-bot
+# Relay-Discord-Bot
 
-Wir verwenden auf unserem Discord einen selbstentwickelten Bot um uns vor Problemen mit den Discord ToS zu schützen. Insbesondere in der ⁠hall-of-graf und ⁠hall-of-fame werden oft Sachen geschrieben, die dafür sorgen könnten, das unsere Accounts eingeschränkt oder sogar direkt gesperrt werden. 
+This bot is designed to protect user accounts on Discord by anonymizing messages sent in specific channels. It's common for content in channels to potentially lead to warnings or even account suspensions from Discord.
 
-Um solche Probleme vorzubeugen haben wir den @RelayBot entwickelt. Der RelayBot nimmt sich alle Nachrichten die in **⁠hall-of-fame** und ⁠**hall-of-graf** gesendet werden und repostet die original Nachricht mithilfe eines Webhooks neu, löscht die Original Nachricht des Users und den Webhook. Das ermöglich uns es das wir fast alles schreiben können was wir wollen ohne das unsere Discord Accounts in Mitleidenschaft gezogen werden. 
+This bot prevents such issues by deleting a user's original message and immediately re-posting the content via a webhook. This severs the direct link between the content and the original author's Discord account.
 
-Wir empfinden es als sehr wichtig das jeder User auf Discord seine Meinung frei äußern kann, auch eventuell mal in einem etwas böserem Ton ohne direkt Probleme mit Discord zu bekommen. Daher haben wir uns entschlossen, den Bot freizugeben für jeden der ihn braucht für seinen eigenen Server.
-Hier ist die ``bot.js`` Datei. Hier müsst ihr nicht viel tun außer die Variable allowedChannelIds abzuändern mit den Channel IDs wo ihr wollt das der Bot dort arbeitet.
-Die ``package.json`` macht ihr einfach mit in den Ordner. Wenn ihr später ```npm install``` ausführt, könnt ihr ganz einfach direkt alle benötigen Pakete installieren.
+---
 
-In die ``.env`` macht ihr bitte euren **Discord Bot Token** und die **ID** von eurem Discord Bot. All diese Informationen findet ihr im [Discord Developer Portal](https://discord.com/developers)
+## How It Works
+
+The RelayBot monitors a predefined set of channels. When a new message from a non-administrator user is detected, it executes the following steps:
+
+1.  **Delete Original Message**: The user's message is immediately removed.
+2.  **Re-post Content**: The text and any attachments are sent again through a channel-specific webhook. The name and avatar are dynamically set to match the original author.
+3.  **Efficient Management**: Instead of deleting the webhook after each use, the bot maintains **one persistent webhook per channel**, which is significantly more performant and respects Discord's API limits.
+4.  **Daily Rotation**: To ensure reliability and freshness, all of the bot's webhooks are **automatically deleted and recreated every 24 hours**.
+
+---
+
+## Features
+
+-   **Message Relaying**: Protects users by re-posting messages via webhooks.
+-   **Efficient Webhook Management**: Utilizes one reusable webhook per channel for maximum performance.
+-   **Daily Rotation**: Automatically renews all webhooks every 24 hours.
+-   **Rate-Limiting**: Prevents spam by limiting messages per minute.
+-   **Simple Configuration**: All setup is handled through a single `.env` file.
+
+---
+
+## Installation & Configuration
+
+Follow these steps to set up the bot on your own server.
+
+### 1. Prerequisites
+-   [Node.js](https://nodejs.org/)
+-   A Discord Bot Account with a Token and Client ID from the [Discord Developer Portal](https://discord.com/developers/applications).
+
+### 2. Clone the Repository
+```bash
+git clone https://github.com/HackVogel/Relay-Discord-bot.git
+cd Relay-Discord-bot-main
