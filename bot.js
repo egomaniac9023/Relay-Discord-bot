@@ -12,19 +12,26 @@ const {
 const sqlite3 = require('sqlite3').verbose();
 const { open } = require('sqlite');
 const path = require('path');
+const fs = require('fs');
 
 const ALLOWED_CHANNEL_IDS = process.env.ALLOWED_CHANNEL_IDS ? process.env.ALLOWED_CHANNEL_IDS.split(',') : [];
 const RATE_LIMIT_WINDOW = 60000;
 const RATE_LIMIT_MAX = 3;
-const ROTATION_INTERVAL = 86400000; // 24 Stunden in Millisekunden
+const ROTATION_INTERVAL = 86400000;
 
 const userMessageCounts = new Map();
 let db;
 
 (async () => {
     try {
+        const dataDir = path.join(__dirname, 'data');
+        if (!fs.existsSync(dataDir)) {
+            fs.mkdirSync(dataDir);
+            console.log('Der "data"-Ordner für die Datenbank wurde erstellt.');
+        }
+
         db = await open({
-            filename: path.join(__dirname, 'data', 'webhooks.db'),
+            filename: path.join(dataDir, 'webhooks.db'),
             driver: sqlite3.Database
         });
 
@@ -68,7 +75,7 @@ async function getOrCreateWebhook(channel) {
         return new WebhookClient({ id: newWebhook.id, token: newWebhook.token });
 
     } catch (error) {
-        if (error instanceof DiscordAPIError && error.code === 10015) { // Unknown Webhook
+        if (error instanceof DiscordAPIError && error.code === 10015) {
              await db.run('DELETE FROM webhooks WHERE channelId = ?', channel.id);
              return getOrCreateWebhook(channel);
         }
@@ -108,25 +115,21 @@ async function rotateWebhooks() {
     for (const webhook of allWebhooks) {
         try {
             const channel = await client.channels.fetch(webhook.channelId);
-            if (!channel) throw new Error('Channel not found');
+            if (!channel) throw new Error('Kanal nicht gefunden');
 
-            // Alten Webhook löschen (ignoriere Fehler, falls er schon weg ist)
             const oldWebhookClient = new WebhookClient({ id: webhook.webhookId, token: webhook.webhookToken });
             await oldWebhookClient.delete().catch(() => {});
 
-            // Neuen Webhook erstellen
             const newWebhook = await channel.createWebhook({
                 name: 'General Webhook',
                 reason: 'Tägliche Rotation'
             });
 
-            // Datenbankeintrag mit neuen Daten aktualisieren
             await db.run('UPDATE webhooks SET webhookId = ?, webhookToken = ? WHERE channelId = ?',
                 newWebhook.id, newWebhook.token, channel.id
             );
             rotatedCount++;
         } catch (error) {
-            // Wenn Kanal/Webhook nicht mehr existiert, aus DB löschen
             console.warn(`Fehler bei Rotation für Kanal ${webhook.channelId}. Entferne Eintrag. Fehler: ${error.message}`);
             await db.run('DELETE FROM webhooks WHERE channelId = ?', webhook.channelId);
         }
@@ -169,7 +172,6 @@ client.once('ready', () => {
         .then(() => console.log('Slash-Befehle erfolgreich registriert.'))
         .catch(console.error);
 
-    // Starte die tägliche Rotation
     rotateWebhooks();
     setInterval(rotateWebhooks, ROTATION_INTERVAL);
 });
@@ -251,5 +253,5 @@ client.on('messageCreate', async message => {
 });
 
 client.login(process.env.DISCORD_BOT_TOKEN).catch(error => {
-    console.error('Fehler beim Einloggen des Bots:', error);
+    console.error('Fehler beim Einloggen:', error);
 });
