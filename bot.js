@@ -58,6 +58,11 @@ let db;
             webhookToken TEXT NOT NULL
         )`);
 
+        await db.run(`CREATE TABLE IF NOT EXISTS bot_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )`);
+
         console.log('Datenbank erfolgreich initialisiert.');
     } catch (error) {
         console.error('Fehler bei der Initialisierung der Datenbank:', error);
@@ -141,6 +146,8 @@ async function rotateWebhooks() {
     const allWebhooks = await db.all('SELECT * FROM webhooks');
     if (allWebhooks.length === 0) {
         console.log('Keine Webhooks zur Rotation in der Datenbank gefunden.');
+        // Trotzdem Zeitstempel aktualisieren, um nicht ständig zu prüfen
+        await db.run("INSERT OR REPLACE INTO bot_meta (key, value) VALUES (?, ?)", 'lastRotationTimestamp', Date.now().toString());
         return;
     }
 
@@ -167,13 +174,15 @@ async function rotateWebhooks() {
             await db.run('DELETE FROM webhooks WHERE channelId = ?', webhook.channelId);
         }
     }
+    // Speichere den Zeitstempel nach einer erfolgreichen Rotation
+    await db.run("INSERT OR REPLACE INTO bot_meta (key, value) VALUES (?, ?)", 'lastRotationTimestamp', Date.now().toString());
     console.log(`Webhook-Rotation abgeschlossen. ${rotatedCount} Webhooks rotiert.`);
 }
 
 
 // --- Event Handlers ---
 
-client.once('ready', () => {
+client.once('ready', async () => {
     console.log(`Bot ist als ${client.user.tag} bereit!`);
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
 
@@ -200,13 +209,46 @@ client.once('ready', () => {
 
     const commands = [relayCommand.toJSON(), webhookCommand.toJSON()];
 
-    rest.put(Routes.applicationCommands(process.env.DISCORD_CLIENT_ID), { body: commands })
-        .then(() => console.log('Slash-Befehle erfolgreich registriert.'))
-        .catch(console.error);
+    try {
+        await rest.put(Routes.applicationCommands(process.env.DISCORD_CLIENT_ID), { body: commands });
+        console.log('Slash-Befehle erfolgreich registriert.');
+    } catch(e) {
+        console.error("Fehler bei der Registrierung der Slash-Befehle:", e);
+    }
 
-    rotateWebhooks();
-    setInterval(rotateWebhooks, ROTATION_INTERVAL);
+    const scheduleRotation = async () => {
+        const lastRotation = await db.get("SELECT value FROM bot_meta WHERE key = ?", 'lastRotationTimestamp');
+        const now = Date.now();
+        let nextRotationTime;
+
+        if (!lastRotation || !lastRotation.value) {
+            console.log("Keine vorherige Rotation gefunden. Führe Rotation sofort aus.");
+            await rotateWebhooks();
+            nextRotationTime = Date.now() + ROTATION_INTERVAL;
+        } else {
+            const lastRotationTimestamp = parseInt(lastRotation.value, 10);
+            if (now >= lastRotationTimestamp + ROTATION_INTERVAL) {
+                console.log("Rotationsintervall überschritten. Führe Rotation aus.");
+                await rotateWebhooks();
+                nextRotationTime = Date.now() + ROTATION_INTERVAL;
+            } else {
+                nextRotationTime = lastRotationTimestamp + ROTATION_INTERVAL;
+                console.log("Nächste planmäßige Rotation ist fällig am:", new Date(nextRotationTime).toLocaleString('de-DE'));
+            }
+        }
+        
+        const delay = nextRotationTime - Date.now();
+        // Setze einen Timer für die nächste Ausführung
+        setTimeout(async () => {
+            await rotateWebhooks();
+            scheduleRotation(); // Plane die übernächste Rotation nach dem Durchlauf
+        }, delay > 0 ? delay : 0);
+    };
+
+    // Starte den Planungs-Prozess
+    await scheduleRotation();
 });
+
 
 client.on('interactionCreate', async interaction => {
     if (!interaction.isCommand()) return;
