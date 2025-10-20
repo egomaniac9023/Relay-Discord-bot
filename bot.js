@@ -13,14 +13,68 @@ const sqlite3 = require('sqlite3').verbose();
 const { open } = require('sqlite');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 const ALLOWED_CHANNEL_IDS = process.env.ALLOWED_CHANNEL_IDS ? process.env.ALLOWED_CHANNEL_IDS.split(',') : [];
 const RATE_LIMIT_WINDOW = 60000;
 const RATE_LIMIT_MAX = 3;
 const ROTATION_INTERVAL = 86400000;
 
+const ENCRYPTED_TOKEN_PREFIX = 'enc:';
+
+class DecryptionError extends Error {
+    constructor(message, { isPlaintext = false } = {}) {
+        super(message);
+        this.name = 'DecryptionError';
+        this.isPlaintext = isPlaintext;
+    }
+}
+
 const userMessageCounts = new Map();
 let db;
+
+const encryptionSecret = process.env.WEBHOOK_TOKEN_SECRET;
+if (!encryptionSecret) {
+    console.error('Die Umgebungsvariable WEBHOOK_TOKEN_SECRET ist erforderlich, um Webhook-Tokens zu schützen.');
+    process.exit(1);
+}
+
+const encryptionKey = crypto.createHash('sha256').update(encryptionSecret).digest();
+
+function encryptWebhookToken(token) {
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', encryptionKey, iv);
+    const ciphertext = Buffer.concat([cipher.update(token, 'utf8'), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+    const payload = Buffer.concat([iv, authTag, ciphertext]).toString('base64');
+    return `${ENCRYPTED_TOKEN_PREFIX}${payload}`;
+}
+
+function decryptWebhookToken(storedToken) {
+    if (!storedToken.startsWith(ENCRYPTED_TOKEN_PREFIX)) {
+        throw new DecryptionError('Token liegt im Klartext vor.', { isPlaintext: true });
+    }
+
+    try {
+        const data = Buffer.from(storedToken.slice(ENCRYPTED_TOKEN_PREFIX.length), 'base64');
+        const iv = data.subarray(0, 12);
+        const authTag = data.subarray(12, 28);
+        const ciphertext = data.subarray(28);
+
+        const decipher = crypto.createDecipheriv('aes-256-gcm', encryptionKey, iv);
+        decipher.setAuthTag(authTag);
+        const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+        return decrypted.toString('utf8');
+    } catch (error) {
+        throw new DecryptionError('Entschlüsselung des Webhook-Tokens fehlgeschlagen.');
+    }
+}
+
+async function ensureEncryptedToken(channelId, token) {
+    const encrypted = encryptWebhookToken(token);
+    await db.run('UPDATE webhooks SET webhookToken = ? WHERE channelId = ?', encrypted, channelId);
+    return encrypted;
+}
 
 (async () => {
     try {
@@ -60,7 +114,23 @@ async function getOrCreateWebhook(channel) {
     try {
         const row = await db.get('SELECT webhookId, webhookToken FROM webhooks WHERE channelId = ?', channel.id);
         if (row) {
-            return new WebhookClient({ id: row.webhookId, token: row.webhookToken });
+            let webhookToken;
+            try {
+                webhookToken = decryptWebhookToken(row.webhookToken);
+            } catch (error) {
+                if (error instanceof DecryptionError && error.isPlaintext) {
+                    webhookToken = row.webhookToken;
+                    await ensureEncryptedToken(channel.id, webhookToken).catch(err => {
+                        console.warn(`Konnte Webhook-Token für Kanal ${channel.id} nicht nachträglich verschlüsseln:`, err);
+                    });
+                } else {
+                    console.warn(`Webhook-Token für Kanal ${channel.id} konnte nicht entschlüsselt werden. Eintrag wird entfernt und neu erstellt.`);
+                    await db.run('DELETE FROM webhooks WHERE channelId = ?', channel.id);
+                    return getOrCreateWebhook(channel);
+                }
+            }
+
+            return new WebhookClient({ id: row.webhookId, token: webhookToken });
         }
 
         const newWebhook = await channel.createWebhook({
@@ -68,8 +138,9 @@ async function getOrCreateWebhook(channel) {
             reason: 'Wiederverwendbarer Webhook für Nachrichten'
         });
 
+        const encryptedToken = encryptWebhookToken(newWebhook.token);
         await db.run('INSERT INTO webhooks (channelId, webhookId, webhookToken) VALUES (?, ?, ?)',
-            channel.id, newWebhook.id, newWebhook.token
+            channel.id, newWebhook.id, encryptedToken
         );
 
         return new WebhookClient({ id: newWebhook.id, token: newWebhook.token });
@@ -117,7 +188,23 @@ async function rotateWebhooks() {
             const channel = await client.channels.fetch(webhook.channelId);
             if (!channel) throw new Error('Kanal nicht gefunden');
 
-            const oldWebhookClient = new WebhookClient({ id: webhook.webhookId, token: webhook.webhookToken });
+            let webhookToken;
+            try {
+                webhookToken = decryptWebhookToken(webhook.webhookToken);
+            } catch (error) {
+                if (error instanceof DecryptionError && error.isPlaintext) {
+                    webhookToken = webhook.webhookToken;
+                    await ensureEncryptedToken(webhook.channelId, webhookToken).catch(err => {
+                        console.warn(`Konnte Webhook-Token für Kanal ${webhook.channelId} nicht nachträglich verschlüsseln:`, err);
+                    });
+                } else {
+                    console.warn(`Webhook-Token für Kanal ${webhook.channelId} konnte nicht entschlüsselt werden und wird entfernt.`);
+                    await db.run('DELETE FROM webhooks WHERE channelId = ?', webhook.channelId);
+                    continue;
+                }
+            }
+
+            const oldWebhookClient = new WebhookClient({ id: webhook.webhookId, token: webhookToken });
             await oldWebhookClient.delete().catch(() => {});
 
             const newWebhook = await channel.createWebhook({
@@ -125,8 +212,9 @@ async function rotateWebhooks() {
                 reason: 'Tägliche Rotation'
             });
 
+            const encryptedToken = encryptWebhookToken(newWebhook.token);
             await db.run('UPDATE webhooks SET webhookId = ?, webhookToken = ? WHERE channelId = ?',
-                newWebhook.id, newWebhook.token, channel.id
+                newWebhook.id, encryptedToken, channel.id
             );
             rotatedCount++;
         } catch (error) {
