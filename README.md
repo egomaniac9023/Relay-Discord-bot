@@ -39,3 +39,8 @@ Follow these steps to set up the bot on your own server.
 ```bash
 git clone https://github.com/HackVogel/Relay-Discord-bot.git
 cd Relay-Discord-bot-main
+
+```
+
+### 3. Configure Environment Variables
+Copy the provided `env` file to `.env` and adjust the values to match your Discord bot configuration. Ensure you set a strong `WEBHOOK_TOKEN_SECRET`, which is used to encrypt webhook tokens before they are stored locally.
